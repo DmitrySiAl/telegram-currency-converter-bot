@@ -1,13 +1,19 @@
 import asyncio
-import aiohttp
 import logging
 import os
 from dotenv import load_dotenv
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 from aiogram.filters import CommandStart
+
+from database import (
+    init_db, get_user_language, set_user_language, get_user_favorites, toggle_favorite
+)
 
 load_dotenv()
 
@@ -15,10 +21,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-user_languages = {}
-
-
 
 RATES_DATA = {
         "USD": 86.59,
@@ -29,37 +31,62 @@ RATES_DATA = {
         "JPY": 0.555
 }
 
-
-
 class ConvertSteps(StatesGroup):
     from_currency = State()
     to_currency = State()
     amount = State()
 
 
-
 @dp.message(CommandStart())
 async def start_command(message: Message):
-    kb = [
-        [KeyboardButton(text="💱 Quick Converter")],
-        [KeyboardButton(text="⭐ Favourite Rates")],
-        [KeyboardButton(text="🌐 Language Selection")]
-    ]
+    tg_lang = message.from_user.language_code or "en"
+
+    lang = await get_user_language(message.from_user.id, telegram_lang=tg_lang)
+
+    welcome_texts = {
+        "en": f"Hello, {message.from_user.first_name}! 👋\n\n"
+    
+              f"I can help you quickly convert amounts or track your favorite currencies.\n\n"
+              f"Please select an option from the menu below 👇",
+        "ru": f"Привет, {message.from_user.first_name}! 👋\n\n"
+     
+              f"Я помогу тебе быстро переводить суммы или отслеживать избранные курсы.\n\n"
+              f"Пожалуйста, выбери нужный раздел в меню ниже 👇",
+        "de": f"Hallo, {message.from_user.first_name}! 👋\n\n"
+         
+              f"Ich kann Ihnen helfen, Beträge schnell umzurechnen oder Ihre bevorzugten Währungen zu verfolgen.\n\n"
+              f"Bitte wählen Sie unten eine Option aus dem Menü 👇"
+    }
+
+    if lang == "ru":
+        kb = [
+            [KeyboardButton(text="💱 Быстрый конвертер")],
+            [KeyboardButton(text="⭐ Избранные курсы")],
+            [KeyboardButton(text="🌐 Выбор языка")]
+        ]
+        placeholder = "Выберите раздел..."
+    elif lang == "de":
+        kb = [
+            [KeyboardButton(text="💱 Schneller Konverter")],
+            [KeyboardButton(text="⭐ Bevorzugte Kurse")],
+            [KeyboardButton(text="🌐 Sprachauswahl")]
+        ]
+        placeholder = "Wählen Sie einen Bereich..."
+    else:
+        kb = [
+            [KeyboardButton(text="💱 Quick Converter")],
+            [KeyboardButton(text="⭐ Favorite Rates")],
+            [KeyboardButton(text="🌐 Language Selection")]
+        ]
+        placeholder = "Select a section..."
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=kb,
         resize_keyboard=True,
-        input_field_placeholder="Select a section..."
+        input_field_placeholder=placeholder
     )
 
-    await message.answer(
-        f"Hello, {message.from_user.first_name}! 👋\n\n"
-        f"I am a currency converter bot powered by ExchangeRate-API.\n"
-        f"I can help you quickly convert amounts or track your favorite currencies.\n\n"
-        f"Please select an option from the menu below 👇",
-        reply_markup=keyboard
-    )
-
+    await message.answer(welcome_texts[lang], reply_markup=keyboard)
 
 
 @dp.message(F.text.in_(["🌐 Language Selection", "🌐 Выбор языка", "🌐 Sprachauswahl"]))
@@ -80,11 +107,9 @@ async def language_menu(message: Message):
         reply_markup=keyboard
     )
 
-
-
 @dp.message(F.text == "Русский")
 async def set_russian(message: Message):
-    user_languages[message.from_user.id] = "ru"
+    await set_user_language(message.from_user.id, "ru")
 
     kb = [
         [KeyboardButton(text="💱 Быстрый конвертер")],
@@ -102,11 +127,9 @@ async def set_russian(message: Message):
         reply_markup=keyboard
     )
 
-
-
 @dp.message(F.text == "English")
 async def set_english(message: Message):
-    user_languages[message.from_user.id] = "en"
+    await set_user_language(message.from_user.id, "en")
     kb = [
         [KeyboardButton(text="💱 Quick Converter")],
         [KeyboardButton(text="⭐ Favorite Rates")],
@@ -123,11 +146,9 @@ async def set_english(message: Message):
         reply_markup=keyboard
     )
 
-
-
 @dp.message(F.text == "Deutsch")
 async def set_german(message: Message):
-    user_languages[message.from_user.id] = "de"
+    await set_user_language(message.from_user.id, "de")
 
     kb = [
         [KeyboardButton(text="💱 Schneller Konverter")],
@@ -147,9 +168,104 @@ async def set_german(message: Message):
 
 
 
+def build_favorites_keyboard(user_favorites: list[str], lang: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for curr in RATES_DATA.keys():
+        text = f"✅ {curr}" if curr in user_favorites else f"❌ {curr}"
+        buttons.append(InlineKeyboardButton(text=text, callback_data=f"toggle_fav_{curr}"))
+
+    keyboard_layout = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+
+    close_text = {"en": "❌ Close Menu", "ru": "❌ Закрыть меню", "de": "❌ Menü schließen"}
+    keyboard_layout.append([InlineKeyboardButton(text=close_text.get(lang, "en"), callback_data="close_fav_menu")])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard_layout)
+
+
+@dp.message(F.text.in_(["⭐ Favorite Rates", "⭐ Избранные курсы", "⭐ Bevorzugte Kurse", "⭐ Favourite Rates"]))
+async def favorite_rates_menu(message: Message):
+    lang = await get_user_language(message.from_user.id)
+    user_favs = await get_user_favorites(message.from_user.id)
+
+    titles = {
+        "en": "⭐ **Your Favorite Rates:**\n\n",
+        "ru": "⭐ **Ваши избранные курсы:**\n\n",
+        "de": "⭐ **Ihre bevorzugten Kurse:**\n\n"
+    }
+
+    body = ""
+    if not user_favs:
+        no_fav_text = {
+            "en": "You haven't added any currencies to your favorites yet.\n\n",
+            "ru": "Вы еще не добавили ни одной валюты в избранное.\n\n",
+            "de": "Sie haben noch keine Währungen zu Ihren Favoriten hinzugefügt.\n\n"
+        }
+        body += no_fav_text[lang]
+    else:
+        for curr in user_favs:
+            if curr in RATES_DATA:
+                rate_in_rub = round(RATES_DATA[curr] / RATES_DATA["RUB"], 4)
+                body += f"• 1 **{curr}** = {rate_in_rub} RUB\n"
+
+    manage_text = {
+        "en": "\n⚙️ *Click buttons below to add/remove currencies:*",
+        "ru": "\n⚙️ *Нажимайте на кнопки ниже, чтобы добавить или удалить валюту:*",
+        "de": "\n⚙️ *Klicken Sie unten, um Währungen hinzuzufügen/удалить:*"
+    }
+
+    full_text = titles[lang] + body + manage_text[lang]
+    kb = build_favorites_keyboard(user_favs, lang)
+
+    await message.answer(full_text, reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("toggle_fav_"))
+async def process_toggle_favorite(callback: CallbackQuery):
+    currency = callback.data.replace("toggle_fav_", "")
+    user_id = callback.from_user.id
+
+    await toggle_favorite(user_id, currency)
+
+    lang = await get_user_language(user_id)
+    user_favs = await get_user_favorites(user_id)
+
+    titles = {"en": "⭐ **Your Favorite Rates:**\n\n", "ru": "⭐ **Ваши избранные курсы:**\n\n",
+              "de": "⭐ **Ihre bevorzugten Kurse:**\n\n"}
+    body = ""
+    if not user_favs:
+        no_fav_text = {"en": "Empty.\n\n", "ru": "Список пуст.\n\n", "de": "Leer.\n\n"}
+        body += no_fav_text[lang]
+    else:
+        for curr in user_favs:
+            if curr in RATES_DATA:
+                rate_in_rub = round(RATES_DATA[curr] / RATES_DATA["RUB"], 4)
+                body += f"• 1 **{curr}** = {rate_in_rub} RUB\n"
+
+    manage_text = {"en": "\n⚙️ *Click buttons below to add/remove currencies:*",
+                   "ru": "\n⚙️ *Нажимайте на кнопки ниже, чтобы добавить или удалить валюту:*",
+                   "de": "\n⚙️ *Klicken Sie unten:*"}
+
+
+    try:
+        await callback.message.edit_text(
+            text=titles[lang] + body + manage_text[lang],
+            reply_markup=build_favorites_keyboard(user_favs, lang),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "close_fav_menu")
+async def close_favorite_menu(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
+
 @dp.message(F.text.in_(["💱 Quick Converter", "💱 Быстрый конвертер", "💱 Schneller Konverter"]))
 async def start_converter(message: Message, state: FSMContext):
-    lang = user_languages.get(message.from_user.id, "en")
+    lang = await get_user_language(message.from_user.id) # Читаем язык из БД
 
     texts = {
         "en": "Select or type the **first currency** (the one you want to convert FROM), e.g., USD:",
@@ -168,10 +284,9 @@ async def start_converter(message: Message, state: FSMContext):
     await message.answer(texts[lang], reply_markup=keyboard)
 
 
-
 @dp.message(ConvertSteps.from_currency)
 async def process_from_currency(message: Message, state: FSMContext):
-    lang = user_languages.get(message.from_user.id, "en")
+    lang = await get_user_language(message.from_user.id)
 
     currency_input = message.text.upper().strip()
 
@@ -192,7 +307,7 @@ async def process_from_currency(message: Message, state: FSMContext):
         "de": f"Super! Sie haben **{currency_input}** ausgewählt.\nWählen oder schreiben Sie nun die **zweite Währung**:"
     }
 
-    kb_symbols = ["USD", "EUR", "RUB", "CNY", "GBP", "GPY"]
+    kb_symbols = ["USD", "EUR", "RUB", "CNY", "GBP", "JPY"]
     if currency_input in kb_symbols:
         kb_symbols.remove(currency_input)
 
@@ -209,8 +324,7 @@ async def process_from_currency(message: Message, state: FSMContext):
 
 @dp.message(ConvertSteps.to_currency)
 async def process_to_currency(message: Message, state: FSMContext):
-    lang = user_languages.get(message.from_user.id, "en")
-
+    lang = await get_user_language(message.from_user.id)
     currency_input = message.text.upper().strip()
 
     if len(currency_input) != 3 or not currency_input.isalpha():
@@ -249,7 +363,7 @@ async def process_to_currency(message: Message, state: FSMContext):
 
 @dp.message(ConvertSteps.amount)
 async def process_amount(message: Message, state: FSMContext):
-    lang = user_languages.get(message.from_user.id, "en")
+    lang = await get_user_language(message.from_user.id) # Читаем язык из БД
 
     amount_input = message.text.replace(",", ".")
 
@@ -276,8 +390,6 @@ async def process_amount(message: Message, state: FSMContext):
         "de": "🔄 Aktuelle Kurse abrufen..."
     }
     waiting_msg = await message.answer(waiting_texts[lang])
-
-
 
     try:
         if from_curr not in RATES_DATA or to_curr not in RATES_DATA:
@@ -329,9 +441,10 @@ async def process_amount(message: Message, state: FSMContext):
     await message.answer(return_texts[lang], reply_markup=keyboard)
 
 async def main():
+    await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
+
